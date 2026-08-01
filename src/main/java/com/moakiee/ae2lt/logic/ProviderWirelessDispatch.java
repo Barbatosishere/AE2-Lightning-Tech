@@ -39,6 +39,8 @@ final class ProviderWirelessDispatch {
     private final ReadyQueue<WirelessConnection, ConnectionState> evenReady;
     private final DispatchFairnessScheduler<WirelessConnection, IPatternDetails> fairness =
             DispatchFairnessScheduler.forCanonicalPatterns();
+    private final WirelessBatchCadence<WirelessConnection> batchCadence =
+            new WirelessBatchCadence<>();
     private final Map<WirelessConnection, Map<IPatternDetails, Penalty>> penalties =
             new HashMap<>();
     private final DueTaskQueue<TargetPatternKey<WirelessConnection>> penaltyExpirations =
@@ -151,6 +153,7 @@ final class ProviderWirelessDispatch {
 
     void removeTarget(WirelessConnection target) {
         removePenalties(target);
+        batchCadence.removeTarget(target);
         fairness.removeTarget(target);
         evenReady.remove(target);
         singleReady.remove(target);
@@ -160,6 +163,7 @@ final class ProviderWirelessDispatch {
     void patternsChanged() {
         penalties.clear();
         penaltyExpirations.clear();
+        batchCadence.clear();
         fairness.clear();
         for (var connection : states.keySet()) {
             ((ProviderTarget) connection).clearBatchHistory();
@@ -393,7 +397,15 @@ final class ProviderWirelessDispatch {
                     state.probeArmed = false;
                 }
                 if (result.ownedCopies > 0L) {
-                    pass.success(connection, result.ownedCopies);
+                    int coverageTicks = batchCadence.recordSuccess(
+                            connection,
+                            pattern,
+                            gameTick,
+                            result.ownedCopies,
+                            result.acceptedFullChunk,
+                            result.requestLimited);
+                    pass.successAndCover(
+                            connection, result.ownedCopies, coverageTicks);
                     recordSuccess(connection, pattern);
                     remaining -= result.ownedCopies;
                     recordPushSuccess(state, probing, gameTick);
@@ -409,6 +421,8 @@ final class ProviderWirelessDispatch {
 
                 switch (result.outcome) {
                     case HARD_FAIL -> {
+                        recordBatchFailure(
+                                connection, pattern, gameTick, result);
                         if (!alive.test(connection)) {
                             pass.remove(connection);
                             removeTarget(connection);
@@ -420,6 +434,8 @@ final class ProviderWirelessDispatch {
                         }
                     }
                     case SOFT_FAIL -> {
+                        recordBatchFailure(
+                                connection, pattern, gameTick, result);
                         long due = recordRejection(
                                 connection, pattern, gameTick, fastMode);
                         pass.cooldown(connection, due);
@@ -433,6 +449,16 @@ final class ProviderWirelessDispatch {
             }
         }
         return remaining;
+    }
+
+    private void recordBatchFailure(
+            WirelessConnection connection,
+            IPatternDetails pattern,
+            long gameTick,
+            BatchAttemptResult result) {
+        if (result.attemptedCopies > 0) {
+            batchCadence.recordFailure(connection, pattern, gameTick);
+        }
     }
 
     private static boolean isProbing(
@@ -507,7 +533,15 @@ final class ProviderWirelessDispatch {
         for (var connection : valid) {
             retained.add(connection);
         }
-        states.keySet().retainAll(retained);
+        var removed = new ArrayList<WirelessConnection>();
+        for (var connection : states.keySet()) {
+            if (!retained.contains(connection)) {
+                removed.add(connection);
+            }
+        }
+        for (var connection : removed) {
+            removeTarget(connection);
+        }
     }
 
     void clear() {
@@ -762,7 +796,11 @@ final class ProviderWirelessDispatch {
     }
 
     record BatchAttemptResult(
-            long ownedCopies, WirelessPushOutcome outcome) {
+            long ownedCopies,
+            int attemptedCopies,
+            boolean acceptedFullChunk,
+            boolean requestLimited,
+            WirelessPushOutcome outcome) {
     }
 
     @FunctionalInterface

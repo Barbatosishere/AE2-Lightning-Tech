@@ -34,6 +34,7 @@ import appeng.helpers.patternprovider.PatternProviderTarget;
  */
 public class ProviderTarget extends TargetAddress {
     private static final int STORAGE_TARGET_CACHE_TTL = 20;
+    private static final int BATCH_HISTORY_TTL = 100;
 
     private final ProviderTargetRuntime runtime =
             new ProviderTargetRuntime();
@@ -326,10 +327,92 @@ public class ProviderTarget extends TargetAddress {
         return new BatchDispatchResult(ownedCopies, false);
     }
 
+    /**
+     * Attempts exactly one adaptive batch chunk for a wireless scheduling
+     * opportunity. The safe cold sequence is {@code 1, 1, 2, 4, ...}; a
+     * rejected chunk is halved for a later opportunity instead of
+     * probing repeatedly in the same target visit.
+     */
+    public final BatchStepResult pushPatternStep(
+            IPatternDetails pattern,
+            long maxCopies,
+            long gameTick,
+            boolean batchSupported,
+            BooleanSupplier blocked,
+            IntFunction<BatchChunk> pushChunk) {
+        if (maxCopies <= 0L || blocked.getAsBoolean()) {
+            return BatchStepResult.EMPTY;
+        }
+        if (!batchSupported) {
+            var single = pushChunk.apply(1);
+            return BatchStepResult.from(single, 1, false);
+        }
+
+        var state = runtime.batchSteps.computeIfAbsent(
+                pattern, ignored -> new BatchStepState());
+        state.expireIfIdle(gameTick);
+
+        int attemptedCopies = (int) Math.min(
+                Math.min((long) state.nextChunk, maxCopies),
+                Integer.MAX_VALUE);
+        boolean requestLimited = attemptedCopies < state.nextChunk;
+        var chunk = pushChunk.apply(attemptedCopies);
+        if (chunk.globalAbort()) {
+            return BatchStepResult.from(
+                    chunk, attemptedCopies, requestLimited);
+        }
+        if (chunk.ownedCopies() <= 0L) {
+            // A successful request-limited tail must not shrink a proven
+            // chunk, but rejecting even that smaller tail is real evidence
+            // that the remembered chunk is no longer safe.
+            state.backOff(attemptedCopies);
+            return BatchStepResult.from(
+                    chunk, attemptedCopies, requestLimited);
+        }
+
+        state.lastSuccessfulTick = gameTick;
+        if (!requestLimited) {
+            if (chunk.ownedCopies() == attemptedCopies
+                    && chunk.fullyInserted()) {
+                state.advance(attemptedCopies);
+            } else {
+                state.backOff(attemptedCopies);
+            }
+        }
+        return BatchStepResult.from(
+                chunk, attemptedCopies, requestLimited);
+    }
+
     public record BatchDispatchResult(
             long ownedCopies, boolean globalAbort) {
         private static final BatchDispatchResult EMPTY =
                 new BatchDispatchResult(0L, false);
+    }
+
+    public record BatchStepResult(
+            long ownedCopies,
+            int attemptedCopies,
+            boolean fullyInserted,
+            boolean globalAbort,
+            boolean requestLimited) {
+        private static final BatchStepResult EMPTY =
+                new BatchStepResult(0L, 0, false, false, false);
+
+        private static BatchStepResult from(
+                BatchChunk chunk,
+                int attemptedCopies,
+                boolean requestLimited) {
+            return new BatchStepResult(
+                    chunk.ownedCopies(),
+                    attemptedCopies,
+                    chunk.fullyInserted(),
+                    chunk.globalAbort(),
+                    requestLimited);
+        }
+
+        public boolean acceptedFullChunk() {
+            return ownedCopies == attemptedCopies && fullyInserted;
+        }
     }
 
     public record BatchChunk(
@@ -394,6 +477,7 @@ public class ProviderTarget extends TargetAddress {
 
     final void clearBatchHistory() {
         runtime.batchChunks.clear();
+        runtime.batchSteps.clear();
     }
 
     private void invalidatePhysicalState() {
@@ -406,6 +490,7 @@ public class ProviderTarget extends TargetAddress {
         runtime.lastOutputReturnScanTick = Long.MIN_VALUE;
         runtime.lastSuccessfulPattern = null;
         runtime.batchChunks.clear();
+        runtime.batchSteps.clear();
     }
 
     /** Mutable state with the same lifetime as this physical target object. */
@@ -423,12 +508,48 @@ public class ProviderTarget extends TargetAddress {
         private long lastOutputReturnScanTick = Long.MIN_VALUE;
         private final IdentityHashMap<IPatternDetails, Integer> batchChunks =
                 new IdentityHashMap<>();
+        private final IdentityHashMap<IPatternDetails, BatchStepState> batchSteps =
+                new IdentityHashMap<>();
         @Nullable
         private IPatternDetails lastSuccessfulPattern;
         @Nullable
         private RoutedPatternOverflow directionalOverflow;
         @Nullable
         private WirelessOverflowQueue.Bucket wirelessOverflow;
+    }
+
+    private static final class BatchStepState {
+        private int nextChunk = 1;
+        private boolean repeatCurrent = true;
+        private long lastSuccessfulTick = Long.MIN_VALUE;
+
+        private void expireIfIdle(long gameTick) {
+            if (lastSuccessfulTick == Long.MIN_VALUE) {
+                return;
+            }
+            if (gameTick < lastSuccessfulTick
+                    || gameTick - lastSuccessfulTick >= BATCH_HISTORY_TTL) {
+                nextChunk = 1;
+                repeatCurrent = true;
+                lastSuccessfulTick = Long.MIN_VALUE;
+            }
+        }
+
+        private void advance(int acceptedChunk) {
+            if (repeatCurrent) {
+                nextChunk = acceptedChunk;
+                repeatCurrent = false;
+                return;
+            }
+            nextChunk = acceptedChunk >= Integer.MAX_VALUE / 2
+                    ? Integer.MAX_VALUE
+                    : acceptedChunk * 2;
+        }
+
+        private void backOff(int rejectedChunk) {
+            nextChunk = Math.max(1, rejectedChunk / 2);
+            repeatCurrent = true;
+        }
     }
 
     private static final class CachedStorageTarget {
