@@ -374,7 +374,9 @@ public class ProviderTarget extends TargetAddress {
 
         var state = runtime.batchSteps.computeIfAbsent(
                 pattern, ignored -> new BatchStepState());
-        state.expireIfIdle(gameTick);
+        state.expireIfIdle(
+                gameTick, preserveBatchHistoryOnRejection);
+        state.lastAttemptTick = gameTick;
 
         int attemptedCopies = (int) Math.min(
                 Math.min((long) state.nextChunk, maxCopies),
@@ -393,7 +395,6 @@ public class ProviderTarget extends TargetAddress {
                     chunk, attemptedCopies, requestLimited);
         }
 
-        state.lastSuccessfulTick = gameTick;
         if (!requestLimited) {
             if (chunk.ownedCopies() == attemptedCopies
                     && chunk.fullyInserted()) {
@@ -402,8 +403,23 @@ public class ProviderTarget extends TargetAddress {
                 state.reject(attemptedCopies, false);
             }
         }
+        state.lastSuccessfulTick = gameTick;
         return BatchStepResult.from(
                 chunk, attemptedCopies, requestLimited);
+    }
+
+    /** Returns the next physical chunk without advancing its adaptive state. */
+    final int batchStepCandidate(
+            IPatternDetails pattern, long maxCopies, long gameTick) {
+        if (maxCopies <= 0L) {
+            return 0;
+        }
+        var state = runtime.batchSteps.computeIfAbsent(
+                pattern, ignored -> new BatchStepState());
+        state.expireIfIdle(gameTick, true);
+        return (int) Math.min(
+                Math.min((long) state.nextChunk, maxCopies),
+                Integer.MAX_VALUE);
     }
 
     public record BatchDispatchResult(
@@ -549,13 +565,22 @@ public class ProviderTarget extends TargetAddress {
         private boolean growthCapped;
         private boolean backingOff;
         private long lastSuccessfulTick = Long.MIN_VALUE;
+        private long lastAttemptTick = Long.MIN_VALUE;
 
-        private void expireIfIdle(long gameTick) {
-            if (lastSuccessfulTick == Long.MIN_VALUE) {
+        private void expireIfIdle(
+                long gameTick, boolean preserveAttemptHistory) {
+            long referenceTick = preserveAttemptHistory
+                    ? lastAttemptTick
+                    : lastSuccessfulTick;
+            if (referenceTick == Long.MIN_VALUE) {
                 return;
             }
-            if (gameTick < lastSuccessfulTick
-                    || gameTick - lastSuccessfulTick >= BATCH_HISTORY_TTL) {
+            boolean expired = preserveAttemptHistory
+                    ? gameTick < referenceTick
+                            || gameTick - referenceTick > BATCH_HISTORY_TTL
+                    : gameTick < referenceTick
+                            || gameTick - referenceTick >= BATCH_HISTORY_TTL;
+            if (expired) {
                 nextChunk = 1;
                 provenChunk = 0;
                 provenSuccesses = 0;
@@ -563,6 +588,7 @@ public class ProviderTarget extends TargetAddress {
                 growthCapped = false;
                 backingOff = false;
                 lastSuccessfulTick = Long.MIN_VALUE;
+                lastAttemptTick = Long.MIN_VALUE;
             }
         }
 

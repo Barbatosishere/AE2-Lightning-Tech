@@ -1,5 +1,6 @@
 package com.moakiee.ae2lt.logic;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.ArrayList;
@@ -36,6 +37,7 @@ class AdaptiveBatchDispatchStressTest {
             Model.fixed("B", 2048, 1, 512),
             Model.fixed("C", 512, 5, 512),
             Model.fixed("D", 2048, 5, 512),
+            Model.fillFallback("E", 576, 20, 9),
             Model.random("R", 2048));
 
     @Test
@@ -48,11 +50,93 @@ class AdaptiveBatchDispatchStressTest {
         assertModels(5_000);
     }
 
+    @Test
+    void finiteJobsRemainEvenAcrossAllTargets() {
+        assertFiniteDistribution(512L, 1);
+        assertFiniteDistribution(2_048L, 4);
+    }
+
+    private static void assertFiniteDistribution(
+            long requestedCopies, int expectedPerTarget) {
+        var dispatch = new ProviderWirelessDispatch();
+        var pattern = new ExplosiveEqualityPattern();
+        var model = Model.fillFallback("finite", 576, 20, 9);
+        var connections = new ArrayList<WirelessConnection>(TARGETS);
+        var machines = new HashMap<WirelessConnection, Machine>(TARGETS * 2);
+        var accepted = new int[TARGETS];
+        for (int target = 0; target < TARGETS; target++) {
+            var connection = new WirelessConnection(
+                    Level.OVERWORLD,
+                    new BlockPos(target, 64, 0),
+                    Direction.NORTH);
+            connections.add(connection);
+            machines.put(connection, new Machine(model, target, 16));
+        }
+
+        long remaining = requestedCopies;
+        int physicalPushes = 0;
+        for (int tick = 0; tick < 16 && remaining > 0L; tick++) {
+            dispatch.prepare(
+                    connections,
+                    tick,
+                    false,
+                    WirelessDispatchMode.EVEN_DISTRIBUTION);
+            int currentTick = tick;
+            int[] pushesThisTick = {0};
+            remaining = dispatch.dispatchBatch(
+                    WirelessDispatchMode.EVEN_DISTRIBUTION,
+                    pattern,
+                    remaining,
+                    tick,
+                    false,
+                    (connection, allowance, exploratoryAttempt,
+                            preserveBatchHistoryOnRejection) -> {
+                        int target = connection.pos().getX();
+                        var step = connection.pushPatternStep(
+                                pattern,
+                                allowance,
+                                currentTick,
+                                true,
+                                preserveBatchHistoryOnRejection,
+                                () -> false,
+                                copies -> {
+                                    pushesThisTick[0]++;
+                                    return machines.get(connection)
+                                            .pushChunk(copies);
+                                });
+                        if (step.ownedCopies() > 0L) {
+                            accepted[target] += (int) step.ownedCopies();
+                        }
+                        return batchAttempt(step);
+                    },
+                    ignored -> true,
+                    ignored -> {
+                        throw new AssertionError(
+                                "live target must not be removed");
+                    });
+            physicalPushes += pushesThisTick[0];
+        }
+
+        assertEquals(0L, remaining,
+                "finite request must finish during the safe cold ramp");
+        for (int target = 0; target < TARGETS; target++) {
+            assertEquals(expectedPerTarget, accepted[target],
+                    "finite request skewed target " + target);
+        }
+        assertEquals(
+                expectedPerTarget == 1 ? TARGETS : TARGETS * 3,
+                physicalPushes,
+                "safe 1,1,2 ramp must not revisit only a target subset");
+    }
+
     private static void assertModels(int ticks) {
         var failures = new ArrayList<String>();
         var summaries = new ArrayList<String>();
         for (var model : MODELS) {
-            var result = simulate(model, ticks);
+            int modelTicks = Math.max(
+                    ticks,
+                    model.startupTicks + ACCEPTANCE_WINDOW_TICKS);
+            var result = simulate(model, modelTicks);
             var evaluation = evaluate(model, result);
             summaries.add(evaluation.summary());
             failures.addAll(evaluation.failures());
@@ -102,7 +186,8 @@ class AdaptiveBatchDispatchStressTest {
                     PENDING_COPIES,
                     tick,
                     false,
-                    (connection, allowance, exploratoryAttempt) -> {
+                    (connection, allowance, exploratoryAttempt,
+                            preserveBatchHistoryOnRejection) -> {
                         var machine = machines.get(connection);
                         int target = connection.pos().getX();
                         var step = connection.pushPatternStep(
@@ -110,7 +195,7 @@ class AdaptiveBatchDispatchStressTest {
                                 allowance,
                                 currentTick,
                                 true,
-                                exploratoryAttempt,
+                                preserveBatchHistoryOnRejection,
                                 () -> false,
                                 copies -> {
                                     result.physicalPushesAt[currentTick]++;
@@ -140,16 +225,7 @@ class AdaptiveBatchDispatchStressTest {
                         } else if (!step.globalAbort()) {
                             result.failedVisitsAt[currentTick]++;
                         }
-                        return new ProviderWirelessDispatch.BatchAttemptResult(
-                                step.ownedCopies(),
-                                step.attemptedCopies(),
-                                step.acceptedFullChunk(),
-                                step.requestLimited(),
-                                step.globalAbort()
-                                        ? WirelessPushOutcome.GLOBAL_ABORT
-                                        : step.ownedCopies() > 0L
-                                                ? WirelessPushOutcome.SUCCESS
-                                                : WirelessPushOutcome.SOFT_FAIL);
+                        return batchAttempt(step);
                     },
                     ignored -> true,
                     ignored -> {
@@ -163,6 +239,20 @@ class AdaptiveBatchDispatchStressTest {
         }
         result.finalStored = stored;
         return result;
+    }
+
+    private static ProviderWirelessDispatch.BatchAttemptResult batchAttempt(
+            ProviderTarget.BatchStepResult step) {
+        return new ProviderWirelessDispatch.BatchAttemptResult(
+                step.ownedCopies(),
+                step.attemptedCopies(),
+                step.acceptedFullChunk(),
+                step.requestLimited(),
+                step.globalAbort()
+                        ? WirelessPushOutcome.GLOBAL_ABORT
+                        : step.ownedCopies() > 0L
+                                ? WirelessPushOutcome.SUCCESS
+                                : WirelessPushOutcome.SOFT_FAIL);
     }
 
     private static Evaluation evaluate(Model model, SimulationResult result) {
@@ -226,7 +316,7 @@ class AdaptiveBatchDispatchStressTest {
                     start + ACCEPTANCE_WINDOW_TICKS);
             double throughput = ratio(processed, theoretical);
             double dispatchMetric = dispatchMetric(
-                    pushes, model.capacity, theoretical);
+                    model, pushes, theoretical, TARGETS);
             if (throughput < minimumAcceptanceWindowThroughput) {
                 minimumAcceptanceWindowThroughput = throughput;
                 minimumAcceptanceWindowStart = start;
@@ -242,9 +332,10 @@ class AdaptiveBatchDispatchStressTest {
                         + model.throughputPercent + "%");
             }
             if (!atMostDispatchPercent(
+                    model,
                     pushes,
-                    model.capacity,
                     theoretical,
+                    TARGETS,
                     model.dispatchPercent)) {
                 recordFailure(failures, model.id + " window [" + start + ","
                         + (start + ACCEPTANCE_WINDOW_TICKS) + ") dispatch="
@@ -373,22 +464,23 @@ class AdaptiveBatchDispatchStressTest {
                  start + ACCEPTANCE_WINDOW_TICKS <= result.ticks;
                  start++) {
                 double targetDispatchMetric = dispatchMetric(
-                        pushes, model.capacity, theoretical);
+                        model, pushes, theoretical, 1);
                 if (targetDispatchMetric > maximumDispatchMetric) {
                     maximumDispatchMetric = targetDispatchMetric;
                     maximumTarget = target;
                     maximumStart = start;
                 }
                 if (!atMostDispatchPercent(
+                        model,
                         pushes,
-                        model.capacity,
                         theoretical,
+                        1,
                         model.dispatchPercent)) {
                     recordFailure(failures, model.id + " target " + target
                             + " window [" + start + ","
                             + (start + ACCEPTANCE_WINDOW_TICKS) + ") dispatch="
                             + percent(dispatchMetric(
-                                    pushes, model.capacity, theoretical))
+                                    model, pushes, theoretical, 1))
                             + " > " + model.dispatchPercent + "% (pushes="
                             + pushes + ", successful=" + successfulPushes
                             + ", accepted=" + accepted + ", theoretical="
@@ -454,13 +546,23 @@ class AdaptiveBatchDispatchStressTest {
             for (int target = 0; target < TARGETS; target++) {
                 long accepted = sum(
                         result.targetAccepted[target], start, start + 100);
-                if (accepted <= 0L) {
+                long physicalPushes = sum(
+                        result.targetPhysicalPushes[target],
+                        start,
+                        start + 100);
+                long fairnessAmount = model.fillFallback
+                        ? physicalPushes
+                        : accepted;
+                if (fairnessAmount <= 0L) {
                     recordFailure(failures, model.id + " target " + target
-                            + " accepted no copies in [" + start + ","
+                            + (model.fillFallback
+                                    ? " received no fallback visit in ["
+                                    : " accepted no copies in [")
+                            + start + ","
                             + (start + 100) + ")");
                     continue;
                 }
-                double comparable = accepted;
+                double comparable = fairnessAmount;
                 if (model.random) {
                     long theoretical = sum(
                             result.targetTheoretical[target], start, start + 100);
@@ -535,9 +637,17 @@ class AdaptiveBatchDispatchStressTest {
     }
 
     private static boolean atMostDispatchPercent(
-            long pushes, long capacity, long theoretical, int percent) {
+            Model model,
+            long pushes,
+            long theoretical,
+            int targetCount,
+            int percent) {
+        if (model.fillFallback) {
+            return pushes * 100L <= targetCount * (long) percent;
+        }
         return theoretical > 0L
-                && pushes * capacity * 100L <= theoretical * (long) percent;
+                && pushes * model.capacity * 100L
+                        <= theoretical * (long) percent;
     }
 
     private static double ratio(long actual, long theoretical) {
@@ -545,10 +655,18 @@ class AdaptiveBatchDispatchStressTest {
     }
 
     private static double dispatchMetric(
-            long pushes, long capacity, long theoretical) {
+            Model model,
+            long pushes,
+            long theoretical,
+            int targetCount) {
+        if (model.fillFallback) {
+            return targetCount <= 0
+                    ? 0.0
+                    : (double) pushes / targetCount;
+        }
         return theoretical <= 0L
                 ? 0.0
-                : (double) pushes * capacity / theoretical;
+                : (double) pushes * model.capacity / theoretical;
     }
 
     private static String percent(double ratio) {
@@ -561,6 +679,7 @@ class AdaptiveBatchDispatchStressTest {
             int period,
             int processingLimit,
             boolean random,
+            boolean fillFallback,
             int startupTicks,
             int throughputPercent,
             int dispatchPercent) {
@@ -568,11 +687,22 @@ class AdaptiveBatchDispatchStressTest {
                 String id, int capacity, int period, int processingLimit) {
             return new Model(
                     id, capacity, period, processingLimit,
-                    false, period * 10, 95, 400);
+                    false, false, period * 10, 95, 400);
+        }
+
+        private static Model fillFallback(
+                String id, int capacity, int period, int processingLimit) {
+            // The baseline is one safety visit per target per 100 ticks;
+            // the shared 400% ceiling therefore permits at most four visits.
+            return new Model(
+                    id, capacity, period, processingLimit,
+                    false, true, period * 10, 95, 400);
         }
 
         private static Model random(String id, int capacity) {
-            return new Model(id, capacity, 0, 0, true, 50, 80, 800);
+            return new Model(
+                    id, capacity, 0, 0,
+                    true, false, 50, 80, 800);
         }
     }
 

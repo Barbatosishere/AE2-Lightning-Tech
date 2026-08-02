@@ -308,7 +308,8 @@ final class ProviderWirelessDispatch {
                 continue;
             }
             boolean probing = isProbing(state, gameTick);
-            var result = attempt.push(connection, remaining, false);
+            var result = attempt.push(
+                    connection, remaining, false, false);
             if (result.outcome.consumesTargetAttempt()) {
                 state.probeArmed = false;
             }
@@ -389,14 +390,30 @@ final class ProviderWirelessDispatch {
                 boolean probing = isProbing(state, gameTick);
                 long share = Math.min(
                         remaining, pass.allowance(connection));
+                boolean fillFallback = batchCadence.isFillFallback(
+                        connection, pattern);
+                if (fillFallback) {
+                    int candidate = ((ProviderTarget) connection)
+                            .batchStepCandidate(
+                                    pattern, remaining, gameTick);
+                    share = Math.min(
+                            remaining,
+                            pass.raiseAllowance(connection, candidate));
+                }
                 if (share <= 0L) {
                     continue;
                 }
                 boolean exploratoryAttempt =
                         batchCadence.isExploratoryAttempt(
                                 connection, pattern);
+                boolean preserveBatchHistory =
+                        batchCadence.shouldPreserveBatchHistory(
+                                connection, pattern, gameTick);
                 var result = attempt.push(
-                        connection, share, exploratoryAttempt);
+                        connection,
+                        share,
+                        exploratoryAttempt,
+                        preserveBatchHistory);
                 if (result.outcome.consumesTargetAttempt()) {
                     state.probeArmed = false;
                 }
@@ -823,7 +840,8 @@ final class ProviderWirelessDispatch {
         BatchAttemptResult push(
                 WirelessConnection connection,
                 long maxCopies,
-                boolean exploratoryAttempt);
+                boolean exploratoryAttempt,
+                boolean preserveBatchHistoryOnRejection);
     }
 
     record BatchAttemptResult(

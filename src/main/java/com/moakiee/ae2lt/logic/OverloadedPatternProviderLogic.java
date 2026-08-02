@@ -549,14 +549,15 @@ public class OverloadedPatternProviderLogic extends PatternProviderLogic
                 maxCraft,
                 gameTick,
                 fastMode,
-                (connection, share, exploratoryAttempt) -> {
+                (connection, share, exploratoryAttempt,
+                        preserveBatchHistoryOnRejection) -> {
                     var result = tryPushBatchToConnection(
                             pattern,
                             patternHandle,
                             oneCopyTemplate,
                             share,
                             oneCopyCost,
-                            exploratoryAttempt,
+                            preserveBatchHistoryOnRejection,
                             connection,
                             server);
                     return new ProviderWirelessDispatch.BatchAttemptResult(
@@ -576,7 +577,7 @@ public class OverloadedPatternProviderLogic extends PatternProviderLogic
             KeyCounter[] oneCopyTemplate,
             long maxCraft,
             double oneCopyCost,
-            boolean exploratoryAttempt,
+            boolean preserveBatchHistoryOnRejection,
             WirelessConnection conn,
             net.minecraft.server.MinecraftServer server) {
         if (wirelessOverflow.contains(conn)) {
@@ -607,7 +608,7 @@ public class OverloadedPatternProviderLogic extends PatternProviderLogic
                 oneCopyTemplate,
                 maxCraft,
                 oneCopyCost,
-                exploratoryAttempt);
+                preserveBatchHistoryOnRejection);
         if (step.ownedCopies() <= 0L) {
             return new BatchTargetDispatchResult(
                     0L,
@@ -682,7 +683,7 @@ public class OverloadedPatternProviderLogic extends PatternProviderLogic
             KeyCounter[] oneCopyTemplate,
             long maxCraft,
             double oneCopyCost,
-            boolean exploratoryAttempt) {
+            boolean preserveBatchHistoryOnRejection) {
         boolean batchSupported = context.target().supportsBatch(
                 context.level(), pattern);
         return context.target().pushPatternStep(
@@ -690,7 +691,7 @@ public class OverloadedPatternProviderLogic extends PatternProviderLogic
                 maxCraft,
                 context.level().getGameTime(),
                 batchSupported,
-                exploratoryAttempt,
+                preserveBatchHistoryOnRejection,
                 () -> isBatchTargetBlocked(context, patternHandle),
                 copies -> pushBatchChunk(
                         context,

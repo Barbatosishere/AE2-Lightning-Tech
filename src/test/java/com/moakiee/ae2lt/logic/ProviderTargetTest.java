@@ -712,6 +712,37 @@ class ProviderTargetTest {
     }
 
     @Test
+    void wirelessBatchStepKeepsHistoryAtTheHundredTickFallbackBoundary() {
+        var pattern = new EmptyPattern();
+        for (long tick = 0L; tick < 4L; tick++) {
+            target.pushPatternStep(
+                    pattern,
+                    100L,
+                    tick,
+                    true,
+                    () -> false,
+                    copies -> new ProviderTarget.BatchChunk(
+                            copies, true, false));
+        }
+
+        var chunks = new ArrayList<Integer>();
+        target.pushPatternStep(
+                pattern,
+                100L,
+                103L,
+                true,
+                true,
+                () -> false,
+                copies -> {
+                    chunks.add(copies);
+                    return new ProviderTarget.BatchChunk(
+                            copies, true, false);
+                });
+
+        assertEquals(List.of(8), chunks);
+    }
+
+    @Test
     void preDispatchReturnIsClaimedOncePerTargetAndTick() {
         var otherTarget = new ProviderTarget(
                 Level.OVERWORLD, BlockPos.ZERO.relative(Direction.EAST), Direction.WEST);
